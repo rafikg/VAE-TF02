@@ -1,10 +1,18 @@
 import tensorflow as tf
+import matplotlib.pyplot as plt
 from tensorflow.keras.models import Model
 from tensorflow.keras.layers import Conv2D, Flatten, Dense, Reshape, \
     Conv2DTranspose
 
+# Destroys the current TF graph
+tf.keras.backend.clear_session()
+
 
 class Encoder(tf.keras.layers.Layer):
+    f"""
+    Encoder layer with two conv layers and one dense layer
+    """
+
     def __init__(self, latent_dim=32, name='encoder'):
         super().__init__(name=name)
         self.latent_dim = latent_dim
@@ -29,6 +37,10 @@ class Encoder(tf.keras.layers.Layer):
 
 
 class Decoder(tf.keras.layers.Layer):
+    f"""
+    Decoder layer with 1 dense layer and 3 Conv2DTranspose layers
+    """
+
     def __init__(self, name='decoder'):
         super().__init__(name=name)
         self.dense = Dense(units=7 * 7 * 32, activation='relu', name='dense')
@@ -64,6 +76,10 @@ class Decoder(tf.keras.layers.Layer):
 
 
 class Sampling(tf.keras.layers.Layer):
+    f"""
+    Sampling layer that implement the parametrization trick
+    """
+
     def __init__(self, name='sampling'):
         super().__init__(name=name)
 
@@ -75,9 +91,22 @@ class Sampling(tf.keras.layers.Layer):
 
 
 class VAE(Model):
-    def __init__(self, latent_dim, name='VAE'):
+    f"""
+    Keras Model Subclass encalpsulate the VAE model
+    """
+
+    def __init__(self,
+                 latent_dim,
+                 loss_object,
+                 optimizer,
+                 train_loss,
+                 name='VAE'):
         super().__init__(name=name)
         self.latent_dim = latent_dim
+        self.loss_object = loss_object
+        self.optimizer = optimizer
+        self.train_loss = train_loss
+        # encoder-decoder layers
         self.encoder = Encoder(latent_dim=latent_dim)
         self.decoder = Decoder()
 
@@ -91,16 +120,125 @@ class VAE(Model):
         return reconstructed
 
     @tf.function
-    def compute_loss(self, x):
-        mean, logvar, z = self.encoder(x)
-        img_recons = self.decoder(z)
-        loss = tf.keras.losses.BinaryCrossentropy()(img_recons, x)
+    def train_for_one_step(self, train_x):
+        """
+        Training for one step. We decorate this function to make it
+        faster.
+        Parameters
+        ----------
+        train_x : tf.data
 
-        return loss
+        Returns
+        -------
 
-    @tf.function
-    def compute_apply_gradients(self, x, optimizer):
+
+        """
         with tf.GradientTape() as tape:
-            loss = self.losses + self.compute_loss(x)
-        gradients = tape.gradient(loss, self.trainable_variables)
-        optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+            image_reconst = self.__call__(train_x)
+            loss = self.loss_object(train_x, image_reconst)
+            loss += self.losses
+        gradients = tape.gradient(loss, self.trainable_weights)
+        self.optimizer.apply_gradients(zip(gradients, self.trainable_weights))
+        self.train_loss(loss)
+
+    def fit(self, train_data, test_data, epochs):
+        """
+        Train the VAE model for epochs number. This function call the train
+        Parameters
+        ----------
+        train_data : tf.data
+        test_data : np.ndarray
+        epochs : int
+
+        Returns
+        -------
+
+        """
+        for epoch in range(epochs):
+            for train_x in train_data:
+                self.train_for_one_step(train_x)
+            template = 'Epoch {}, Loss: {}'
+            print(template.format(epoch + 1, self.train_loss.result()))
+            self.generate_and_save_images(epoch, test_data)
+            # Reset the metrics for the next epoch
+            self.train_loss.reset_states()
+
+    def generate_and_save_images(self, epoch, test_input):
+        """
+        Generate and save image using the random test_input
+        Parameters
+        ----------
+        epoch : int
+        test_input : np.ndarray
+
+        Returns
+        -------
+
+        """
+        predictions = self.decoder(test_input)
+        fig = plt.figure(figsize=(4, 4))
+
+        for i in range(predictions.shape[0]):
+            plt.subplot(4, 4, i + 1)
+            plt.imshow(predictions[i, :, :, 0], cmap='gray')
+            plt.axis('off')
+
+        # tight_layout minimizes the overlap between 2 sub-plots
+        plt.savefig('result/image_at_epoch_{:04d}.png'.format(epoch))
+        plt.show()
+
+
+if __name__ == "__main__":
+
+    # Define some `hyper-parameters`
+    TRAIN_BUF = 1024
+    BATCH_SIZE = 100
+    TEST_BUF = 10000
+    EPOCHS = 100
+    NUMBER_OF_GENERATED_IMG = 16
+    LATENT_DIM = 64
+    RANDOM_VECTOR_FOR_GENERATION = tf.random.normal(
+        shape=[NUMBER_OF_GENERATED_IMG, LATENT_DIM])
+
+    (train_images, _), (test_images, _) = tf.keras.datasets.mnist.load_data()
+
+    train_images = train_images.reshape(train_images.shape[0], 28, 28,
+                                        1).astype(
+        'float32')
+    test_images = test_images.reshape(test_images.shape[0], 28, 28, 1).astype(
+        'float32')
+
+    # Normalizing the images
+    train_images /= 255.
+    test_images /= 255.
+
+    # Binarization
+    train_images[train_images >= .5] = 1.
+    train_images[train_images < .5] = 0.
+    test_images[test_images >= .5] = 1.
+    test_images[test_images < .5] = 0.
+
+    # tf.data to create batches and shuffle dataset
+    train_dataset = tf.data.Dataset.from_tensor_slices(train_images)
+    train_dataset = train_dataset.shuffle(TRAIN_BUF).batch(BATCH_SIZE)
+
+    test_dataset = tf.data.Dataset.from_tensor_slices(test_images)
+    test_dataset = test_dataset.shuffle(TEST_BUF).batch(BATCH_SIZE)
+
+    # Specify loss object
+    loss_object = tf.keras.losses.BinaryCrossentropy()
+
+    # Specify the optimizer
+    optimizer = tf.keras.optimizers.Adam(1e-3)
+
+    # Specify metrics for training loss
+    train_loss = tf.keras.metrics.Mean(name='train_loss')
+
+    # Create an instance of the model
+    model = VAE(latent_dim=LATENT_DIM,
+                loss_object=loss_object,
+                optimizer=optimizer,
+                train_loss=train_loss)
+
+    model.fit(train_data=train_dataset, test_data=RANDOM_VECTOR_FOR_GENERATION,
+              epochs=EPOCHS)
